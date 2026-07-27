@@ -111,6 +111,33 @@ pub fn main() !void {
 
 See [examples/logs/std_log_basic.zig](./examples/logs/std_log_basic.zig) and [examples/logs/std_log_migration.zig](./examples/logs/std_log_migration.zig) for complete examples.
 
+### Linux `user_events` Log Exporter
+
+On Linux 6.4+, logs can be written to [`user_events`](https://docs.kernel.org/trace/user_events.html)
+tracepoints instead of being shipped over OTLP. The process writes into a kernel
+ring buffer and an out-of-band agent (`perf`, ftrace, or a collector) reads it,
+so there is no exporter thread, no batching, and no socket. Emitting costs a
+single relaxed load while nothing is collecting.
+
+```zig
+const CheckoutLogs = sdk.logs.UserEventsExporter(.{
+    .provider_name = "myapp_checkout",
+    .event_name = "CheckoutLog",
+    .attributes = &.{
+        .{ .key = "user.id", .type = .int },
+        .{ .key = "http.route", .type = .string },
+    },
+});
+```
+
+The schema is declared at comptime, so the EventHeader metadata is a compile-time
+constant and encoding never allocates. Events are byte-compatible with the Rust
+[`opentelemetry-user-events-logs`](https://github.com/open-telemetry/opentelemetry-rust-contrib/tree/main/opentelemetry-user-events-logs)
+crate.
+
+See [docs/user-events-logs.md](./opentelemetry-sdk/docs/user-events-logs.md) and
+[examples/logs/user_events.zig](./opentelemetry-sdk/examples/logs/user_events.zig).
+
 ## C Language Bindings
 
 The SDK provides C-compatible bindings, allowing C programs to use OpenTelemetry instrumentation. The C API covers all three signals: Traces, Metrics, and Logs.
