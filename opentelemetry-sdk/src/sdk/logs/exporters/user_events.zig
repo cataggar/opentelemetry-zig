@@ -25,8 +25,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const abi = @import("user_events").abi;
-const eh = @import("user_events").eventheader;
+const ue = @import("user_events");
+const abi = ue.abi;
+const eh = ue.eventheader;
 
 const logs = @import("../../../api/logs/logger_provider.zig");
 const Attribute = @import("../../../attributes.zig").Attribute;
@@ -36,9 +37,6 @@ const EnabledParameters = @import("../../../api/logs/enabled_parameters.zig").En
 
 const log = std.log.scoped(.user_events_exporter);
 
-/// Registration schema shared by every EventHeader tracepoint.
-const registration_schema = "u8 eventheader_flags; u8 version; u16 id; u16 tag; u8 opcode; u8 level";
-
 /// Common Schema version emitted in `__csver__` (0x400).
 const cs_version: u32 = 1024;
 
@@ -46,7 +44,10 @@ const cs_version: u32 = 1024;
 const cloud_role_key = "service.name";
 const cloud_role_instance_key = "service.instance.id";
 
-const level_count = 5;
+const level_count = ue.event.level_count;
+
+/// Registration schema shared by every EventHeader tracepoint.
+const registration_schema = ue.event.registration_schema;
 
 /// Type a declared attribute is emitted as. A record value of a different type
 /// is emitted as this type's zero value, keeping the schema stable.
@@ -157,31 +158,34 @@ pub fn UserEventsExporter(comptime options: Options) type {
     }
     comptime validateOptions(options);
 
-    const event = comptime buildEvent(options);
-    const Def = eh.Definition(event);
+    // The Common Schema layout, expressed as a Zig type. Everything below
+    // encodes values of this type, so the wire schema and the values the
+    // exporter builds cannot drift apart.
+    const Schema = CommonSchema(options);
 
-    comptime {
-        if (Def.fixed_payload_bytes > Def.max_payload_bytes) {
-            @compileError("user_events schema declares more fixed payload bytes than an event can carry");
-        }
-    }
-
-    const tracepoint_registrations = comptime buildRegistrations(options);
+    const Events = ue.LeveledEvent(.{
+        .provider = options.provider_name,
+        .name = options.event_name,
+        .keyword = options.keyword,
+    }, Schema);
 
     return struct {
         const Self = @This();
 
+        /// The Common Schema layout as a Zig struct type.
+        pub const Payload = Schema;
+
         /// The comptime EventHeader definition backing this exporter. Exposed
         /// for tests and for tooling that needs the schema bytes.
-        pub const definition = Def;
+        pub const definition = Events.definition;
 
         /// Tracepoint registration strings, indexed by `level - 1`.
-        pub const registrations = tracepoint_registrations;
+        pub const registrations = Events.name_args;
 
         allocator: std.mem.Allocator,
         arena: std.heap.ArenaAllocator,
-        data_file: abi.DataFile,
-        tracepoints: [level_count]abi.Tracepoint,
+        provider: ue.Provider,
+        events: Events,
         cloud_role: []const u8,
         cloud_role_instance: []const u8,
         resource_values: [options.resource_attributes.len]Value,
@@ -204,8 +208,8 @@ pub fn UserEventsExporter(comptime options: Options) type {
             self.* = .{
                 .allocator = allocator,
                 .arena = std.heap.ArenaAllocator.init(allocator),
-                .data_file = .{},
-                .tracepoints = @splat(.{}),
+                .provider = .{},
+                .events = .{},
                 .cloud_role = "",
                 .cloud_role_instance = "",
                 .resource_values = @splat(.{ .string = "" }),
@@ -247,7 +251,7 @@ pub fn UserEventsExporter(comptime options: Options) type {
         /// to. Callers can use it to skip building an expensive record.
         pub fn isEnabled(self: *const Self, severity_number: u8) bool {
             if (self.is_shutdown) return false;
-            return self.tracepointFor(levelFromSeverity(severity_number)).isEnabled();
+            return self.events.isEnabled(levelFromSeverity(severity_number));
         }
 
         /// True when at least one tracepoint reached the kernel. Registration
@@ -255,14 +259,7 @@ pub fn UserEventsExporter(comptime options: Options) type {
         /// all, independently of whether anything is currently listening.
         pub fn isRegistered(self: *const Self) bool {
             if (self.is_shutdown) return false;
-            for (&self.tracepoints) |*tracepoint| {
-                if (tracepoint.isRegistered()) return true;
-            }
-            return false;
-        }
-
-        fn tracepointFor(self: *const Self, level: eh.Level) *const abi.Tracepoint {
-            return &self.tracepoints[level.toInt() - 1];
+            return self.events.isRegistered();
         }
 
         fn resolveResource(self: *Self, resource: ?[]const Attribute) std.mem.Allocator.Error!void {
@@ -299,7 +296,7 @@ pub fn UserEventsExporter(comptime options: Options) type {
 
         fn register(self: *Self) void {
             const path = options.data_file_path;
-            const open_result = if (path) |p| self.data_file.openPath(p) else self.data_file.open();
+            const open_result = if (path) |p| self.provider.openPath(p) else self.provider.open();
             open_result catch |err| {
                 switch (err) {
                     error.Unsupported => log.info(
@@ -318,33 +315,17 @@ pub fn UserEventsExporter(comptime options: Options) type {
                 return;
             };
 
-            var registered: usize = 0;
-            for (&self.tracepoints, 0..) |*tracepoint, index| {
-                tracepoint.register(&self.data_file, registrations[index]) catch |err| {
-                    log.warn(
-                        "failed to register tracepoint '{s}': {t}",
-                        .{ registrations[index], err },
-                    );
-                    continue;
-                };
-                registered += 1;
-            }
-
             // Registration is best effort: a level that failed simply stays
             // disabled. Only drop the descriptor if nothing registered at all.
-            if (registered == 0) self.data_file.close();
+            if (self.events.register(&self.provider) == 0) self.provider.close();
         }
 
         fn shutdownInternal(self: *Self) void {
             if (self.is_shutdown) return;
             self.is_shutdown = true;
 
-            for (&self.tracepoints) |*tracepoint| {
-                tracepoint.unregister(&self.data_file) catch |err| {
-                    log.warn("failed to unregister a '{s}' tracepoint: {t}", .{ options.provider_name, err });
-                };
-            }
-            self.data_file.close();
+            self.events.unregister(&self.provider);
+            self.provider.close();
         }
 
         fn exportLogsFn(ctx: *anyopaque, log_records: []logs.ReadableLogRecord) anyerror!void {
@@ -367,27 +348,27 @@ pub fn UserEventsExporter(comptime options: Options) type {
         }
 
         fn writeRecord(self: *const Self, record: logs.ReadableLogRecord) abi.WriteError!void {
-            const severity = record.severity_number orelse options.default_severity_number;
-            const level = levelFromSeverity(severity);
-            const tracepoint = self.tracepointFor(level);
-            if (!tracepoint.isEnabled()) return;
+            const level = levelFromSeverity(record.severity_number orelse options.default_severity_number);
+            if (!self.events.isEnabled(level)) return;
 
-            var buffers: EventBuffers = undefined;
-            try tracepoint.writev(self.encodeEvent(record, level, &buffers));
+            var strings: StringBuffers = .{};
+            return self.events.write(level, self.buildPayload(record, &strings));
         }
 
-        /// Scratch space an encoded event borrows from.
+        /// Scratch space for the values an event borrows.
         ///
         /// Formatted values must outlive the write because the encoder
         /// references them from iovecs instead of copying, so they live in one
-        /// caller-owned struct rather than in `encodeEvent`'s frame.
+        /// caller-owned struct rather than in a callee's frame.
+        pub const StringBuffers = struct {
+            time: [rfc3339_buffer_size]u8 = undefined,
+            trace_id: [32]u8 = undefined,
+            span_id: [16]u8 = undefined,
+        };
+
         pub const EventBuffers = struct {
-            time: [rfc3339_buffer_size]u8,
-            trace_id: [32]u8,
-            span_id: [16]u8,
-            header: [eh.header_size]u8,
-            scratch: [Def.fixed_payload_bytes]u8,
-            vectors: [Def.max_iovecs]abi.Iovec,
+            strings: StringBuffers = .{},
+            event: Events.Buffers = .{},
         };
 
         /// Encodes one record into `buffers` and returns the vectors to submit.
@@ -401,53 +382,83 @@ pub fn UserEventsExporter(comptime options: Options) type {
             level: eh.Level,
             buffers: *EventBuffers,
         ) []abi.Iovec {
-            buffers.header = eh.headerBytes(level);
+            return Events.encode(
+                level,
+                self.buildPayload(record, &buffers.strings),
+                &buffers.event,
+            );
+        }
 
-            var writer = PayloadWriter{
-                .scratch = &buffers.scratch,
-                .vectors = &buffers.vectors,
-                .string_budget = Def.max_payload_bytes - Def.fixed_payload_bytes,
-            };
-
-            writer.reserveWriteIndex();
-            writer.putStatic(&buffers.header);
-            writer.putStatic(&Def.metadata_extension);
-
-            const severity = record.severity_number orelse options.default_severity_number;
-
+        /// Projects a log record onto the fixed schema.
+        ///
+        /// Undeclared attributes are dropped and a declared attribute carrying
+        /// the wrong type becomes that type's zero value, which is what keeps
+        /// one event name bound to one layout.
+        fn buildPayload(
+            self: *const Self,
+            record: logs.ReadableLogRecord,
+            strings: *StringBuffers,
+        ) Schema {
             var slots: [options.attributes.len]?AttributeValue = @splat(null);
             var event_id: i64 = 0;
             collectAttributes(record.attributes, &slots, &event_id);
 
-            // Field order must match `buildEvent` exactly.
-            writer.putU32(cs_version);
+            var payload: Schema = undefined;
+            payload.@"__csver__" = cs_version;
 
-            const event_time = record.timestamp orelse record.observed_timestamp;
-            writer.putString(formatRfc3339(event_time, &buffers.time));
-            if (options.trace_context) {
-                writer.putString(if (record.trace_id) |id| formatHex(&id, &buffers.trace_id) else "");
-                writer.putString(if (record.span_id) |id| formatHex(&id, &buffers.span_id) else "");
-            }
-            if (options.cloud_role) {
-                writer.putString(self.cloud_role);
-                writer.putString(self.cloud_role_instance);
+            {
+                var part: @FieldType(Schema, "PartA") = undefined;
+                part.time = formatRfc3339(
+                    record.timestamp orelse record.observed_timestamp,
+                    &strings.time,
+                );
+                if (comptime options.trace_context) {
+                    part.ext_dt_traceId = if (record.trace_id) |id|
+                        formatHex(&id, &strings.trace_id)
+                    else
+                        "";
+                    part.ext_dt_spanId = if (record.span_id) |id|
+                        formatHex(&id, &strings.span_id)
+                    else
+                        "";
+                }
+                if (comptime options.cloud_role) {
+                    part.ext_cloud_role = self.cloud_role;
+                    part.ext_cloud_roleInstance = self.cloud_role_instance;
+                }
+                payload.PartA = part;
             }
 
-            inline for (options.attributes, 0..) |declared, index| {
-                writer.putValue(declared.type, Value.fromOptional(declared.type, slots[index]));
-            }
-            inline for (options.resource_attributes, 0..) |declared, index| {
-                writer.putValue(declared.type, self.resource_values[index]);
+            if (comptime has_part_c) {
+                var part: @FieldType(Schema, "PartC") = undefined;
+                inline for (options.attributes, 0..) |declared, index| {
+                    @field(part, declared.fieldName()) =
+                        Value.fromOptional(declared.type, slots[index]).unwrap(declared.type);
+                }
+                inline for (options.resource_attributes, 0..) |declared, index| {
+                    @field(part, declared.fieldName()) =
+                        self.resource_values[index].unwrap(declared.type);
+                }
+                payload.PartC = part;
             }
 
-            writer.putString(options.type_name);
-            if (options.body) writer.putString(record.body orelse "");
-            writer.putI16(@intCast(@min(severity, std.math.maxInt(i16))));
-            if (options.severity_text) writer.putString(record.severity_text orelse "");
-            if (options.event_id_attribute != null) writer.putI64(event_id);
+            {
+                var part: @FieldType(Schema, "PartB") = undefined;
+                part._typeName = options.type_name;
+                if (comptime options.body) part.body = record.body orelse "";
+                part.severityNumber = @intCast(@min(
+                    record.severity_number orelse options.default_severity_number,
+                    std.math.maxInt(i16),
+                ));
+                if (comptime options.severity_text) part.severityText = record.severity_text orelse "";
+                if (comptime options.event_id_attribute != null) part.eventId = event_id;
+                payload.PartB = part;
+            }
 
-            return writer.finish();
+            return payload;
         }
+
+        const has_part_c = options.attributes.len + options.resource_attributes.len > 0;
 
         fn collectAttributes(
             attributes: []const Attribute,
@@ -470,90 +481,132 @@ pub fn UserEventsExporter(comptime options: Options) type {
                 }
             }
         }
-
-        /// Encodes an event into a scratch buffer and a vector list.
-        ///
-        /// Scalars accumulate into `scratch` and are emitted as a single vector
-        /// per run; string bytes are referenced in place. Because `scratch` is a
-        /// fixed stack array, vectors pointing into it stay valid while later
-        /// fields are appended.
-        const PayloadWriter = struct {
-            scratch: *[Def.fixed_payload_bytes]u8,
-            scratch_len: usize = 0,
-            run_start: usize = 0,
-            vectors: *[Def.max_iovecs]abi.Iovec,
-            vector_count: usize = 0,
-            /// Bytes still available for string contents. Fixed-width fields and
-            /// length prefixes are already reserved out of this budget.
-            string_budget: usize,
-
-            fn reserveWriteIndex(self: *PayloadWriter) void {
-                self.vectors[self.vector_count] = .{ .base = "", .len = 0 };
-                self.vector_count += 1;
-            }
-
-            fn putStatic(self: *PayloadWriter, bytes: []const u8) void {
-                self.pushVector(bytes);
-            }
-
-            fn putU32(self: *PayloadWriter, value: u32) void {
-                self.putScalar(u32, value);
-            }
-
-            fn putI16(self: *PayloadWriter, value: i16) void {
-                self.putScalar(u16, @bitCast(value));
-            }
-
-            fn putI64(self: *PayloadWriter, value: i64) void {
-                self.putScalar(u64, @bitCast(value));
-            }
-
-            fn putValue(self: *PayloadWriter, comptime kind: AttributeType, value: Value) void {
-                switch (kind) {
-                    .string => self.putString(value.string),
-                    .int => self.putI64(value.int),
-                    .double => self.putScalar(u64, @bitCast(value.double)),
-                    .bool => self.putScalar(u8, @intFromBool(value.bool)),
-                }
-            }
-
-            /// `T` is the unsigned integer of the field's wire width; signed and
-            /// floating point values are bit-cast by the caller.
-            fn putScalar(self: *PayloadWriter, comptime T: type, value: T) void {
-                const size = @sizeOf(T);
-                std.mem.writeInt(T, self.scratch[self.scratch_len..][0..size], value, .little);
-                self.scratch_len += size;
-            }
-
-            fn putString(self: *PayloadWriter, value: []const u8) void {
-                const limit = @min(self.string_budget, std.math.maxInt(u16));
-                const bytes = truncateUtf8(value, limit);
-                self.string_budget -= bytes.len;
-
-                self.putScalar(u16, @intCast(bytes.len));
-                if (bytes.len == 0) return;
-
-                self.flushRun();
-                self.pushVector(bytes);
-            }
-
-            fn flushRun(self: *PayloadWriter) void {
-                if (self.scratch_len == self.run_start) return;
-                self.pushVector(self.scratch[self.run_start..self.scratch_len]);
-                self.run_start = self.scratch_len;
-            }
-
-            fn pushVector(self: *PayloadWriter, bytes: []const u8) void {
-                self.vectors[self.vector_count] = .{ .base = bytes.ptr, .len = bytes.len };
-                self.vector_count += 1;
-            }
-
-            fn finish(self: *PayloadWriter) []abi.Iovec {
-                self.flushRun();
-                return self.vectors[0..self.vector_count];
-            }
-        };
     };
+}
+
+/// Zig type a declared attribute is emitted as.
+fn ZigType(comptime kind: AttributeType) type {
+    return switch (kind) {
+        .string => []const u8,
+        .int => i64,
+        .double => f64,
+        .bool => bool,
+    };
+}
+
+const FieldAttributes = std.builtin.Type.StructField.Attributes;
+
+/// Builds the Common Schema layout as a Zig struct type.
+///
+/// Field order is `__csver__`, `PartA`, `PartC`, `PartB`, matching the Rust
+/// exporter so existing decoders see the same layout.
+fn CommonSchema(comptime options: Options) type {
+    comptime {
+        var names: [4][:0]const u8 = undefined;
+        var types: [4]type = undefined;
+        var count: usize = 0;
+
+        names[count] = "__csver__";
+        types[count] = u32;
+        count += 1;
+
+        names[count] = "PartA";
+        types[count] = PartAType(options);
+        count += 1;
+
+        if (options.attributes.len + options.resource_attributes.len > 0) {
+            names[count] = "PartC";
+            types[count] = PartCType(options);
+            count += 1;
+        }
+
+        names[count] = "PartB";
+        types[count] = PartBType(options);
+        count += 1;
+
+        return buildStruct(names[0..count].*, types[0..count].*);
+    }
+}
+
+fn PartAType(comptime options: Options) type {
+    comptime {
+        var names: [5][:0]const u8 = undefined;
+        var count: usize = 0;
+
+        names[count] = "time";
+        count += 1;
+        if (options.trace_context) {
+            names[count] = "ext_dt_traceId";
+            count += 1;
+            names[count] = "ext_dt_spanId";
+            count += 1;
+        }
+        if (options.cloud_role) {
+            names[count] = "ext_cloud_role";
+            count += 1;
+            names[count] = "ext_cloud_roleInstance";
+            count += 1;
+        }
+
+        return buildStruct(names[0..count].*, @as([count]type, @splat([]const u8)));
+    }
+}
+
+fn PartBType(comptime options: Options) type {
+    comptime {
+        var names: [5][:0]const u8 = undefined;
+        var types: [5]type = undefined;
+        var count: usize = 0;
+
+        names[count] = "_typeName";
+        types[count] = []const u8;
+        count += 1;
+
+        if (options.body) {
+            names[count] = "body";
+            types[count] = []const u8;
+            count += 1;
+        }
+
+        names[count] = "severityNumber";
+        types[count] = i16;
+        count += 1;
+
+        if (options.severity_text) {
+            names[count] = "severityText";
+            types[count] = []const u8;
+            count += 1;
+        }
+        if (options.event_id_attribute != null) {
+            names[count] = "eventId";
+            types[count] = i64;
+            count += 1;
+        }
+
+        return buildStruct(names[0..count].*, types[0..count].*);
+    }
+}
+
+fn PartCType(comptime options: Options) type {
+    comptime {
+        const total = options.attributes.len + options.resource_attributes.len;
+        var names: [total][:0]const u8 = undefined;
+        var types: [total]type = undefined;
+        var count: usize = 0;
+
+        for (options.attributes ++ options.resource_attributes) |declared| {
+            names[count] = std.fmt.comptimePrint("{s}", .{declared.fieldName()});
+            types[count] = ZigType(declared.type);
+            count += 1;
+        }
+
+        return buildStruct(names, types);
+    }
+}
+
+fn buildStruct(comptime names: anytype, comptime types: anytype) type {
+    const attributes: [names.len]FieldAttributes = @splat(.{});
+    return @Struct(.auto, null, &names, &types, &attributes);
 }
 
 /// A resolved attribute value, always matching its declared `AttributeType`.
@@ -584,6 +637,16 @@ const Value = union(enum) {
         };
     }
 
+    /// Narrows to the concrete Zig type the schema declares for `kind`.
+    fn unwrap(self: Value, comptime kind: AttributeType) ZigType(kind) {
+        return switch (kind) {
+            .string => self.string,
+            .int => self.int,
+            .double => self.double,
+            .bool => self.bool,
+        };
+    }
+
     fn resolve(
         allocator: std.mem.Allocator,
         comptime kind: AttributeType,
@@ -602,16 +665,6 @@ fn dupeString(allocator: std.mem.Allocator, value: AttributeValue) std.mem.Alloc
         .string => |text| allocator.dupe(u8, text),
         else => "",
     };
-}
-
-/// Truncates to at most `limit` bytes without splitting a UTF-8 sequence.
-fn truncateUtf8(value: []const u8, limit: usize) []const u8 {
-    if (value.len <= limit) return value;
-
-    var end = limit;
-    // Continuation bytes are 0b10xxxxxx; back up to the start of the sequence.
-    while (end > 0 and (value[end] & 0xc0) == 0x80) end -= 1;
-    return value[0..end];
 }
 
 fn formatHex(bytes: []const u8, buffer: []u8) []const u8 {
@@ -672,145 +725,11 @@ fn validateOptions(comptime options: Options) void {
         }
     }
 
-    for (buildRegistrations(options)) |registration| {
-        if (registration.len > abi.max_name_args_len) {
-            @compileError("user_events registration string exceeds the kernel limit: '" ++ registration ++ "'");
-        }
-    }
-
     if (options.attributes.len + options.resource_attributes.len > 127) {
         @compileError("PartC cannot hold more than 127 attributes");
     }
     if (options.default_severity_number == 0 or options.default_severity_number > 24) {
         @compileError("default_severity_number must be an OTel severity number in 1..24");
-    }
-}
-
-/// Builds the `<provider>_L<level>K<keyword> <schema>` string for every level.
-fn buildRegistrations(comptime options: Options) [level_count][:0]const u8 {
-    comptime {
-        var result: [level_count][:0]const u8 = undefined;
-        for (&result, 1..) |*registration, level| {
-            registration.* = std.fmt.comptimePrint("{s}_L{x}K{x} {s}", .{
-                options.provider_name,
-                level,
-                options.keyword,
-                registration_schema,
-            });
-        }
-        return result;
-    }
-}
-
-/// Builds the Common Schema event definition.
-///
-/// Field order is `__csver__`, `PartA`, `PartC`, `PartB`, matching the Rust
-/// exporter so existing decoders see the same layout.
-fn buildEvent(comptime options: Options) eh.Event {
-    comptime {
-        var fields: [4]eh.Field = undefined;
-        var count: usize = 0;
-
-        fields[count] = .{ .name = "__csver__", .encoding = .value32, .format = .unsigned_int };
-        count += 1;
-
-        fields[count] = .{ .name = "PartA", .encoding = .structure, .children = partAFields(options) };
-        count += 1;
-
-        const part_c = partCFields(options);
-        if (part_c.len > 0) {
-            fields[count] = .{ .name = "PartC", .encoding = .structure, .children = part_c };
-            count += 1;
-        }
-
-        fields[count] = .{ .name = "PartB", .encoding = .structure, .children = partBFields(options) };
-        count += 1;
-
-        const result = fields[0..count].*;
-        return .{ .name = options.event_name, .fields = &result };
-    }
-}
-
-fn partAFields(comptime options: Options) []const eh.Field {
-    comptime {
-        var fields: [5]eh.Field = undefined;
-        var count: usize = 0;
-
-        fields[count] = .{ .name = "time", .encoding = .string_length16_char8 };
-        count += 1;
-
-        if (options.trace_context) {
-            fields[count] = .{ .name = "ext_dt_traceId", .encoding = .string_length16_char8 };
-            count += 1;
-            fields[count] = .{ .name = "ext_dt_spanId", .encoding = .string_length16_char8 };
-            count += 1;
-        }
-        if (options.cloud_role) {
-            fields[count] = .{ .name = "ext_cloud_role", .encoding = .string_length16_char8 };
-            count += 1;
-            fields[count] = .{ .name = "ext_cloud_roleInstance", .encoding = .string_length16_char8 };
-            count += 1;
-        }
-
-        const result = fields[0..count].*;
-        return &result;
-    }
-}
-
-fn partBFields(comptime options: Options) []const eh.Field {
-    comptime {
-        var fields: [5]eh.Field = undefined;
-        var count: usize = 0;
-
-        fields[count] = .{ .name = "_typeName", .encoding = .string_length16_char8 };
-        count += 1;
-
-        if (options.body) {
-            fields[count] = .{ .name = "body", .encoding = .string_length16_char8 };
-            count += 1;
-        }
-
-        fields[count] = .{ .name = "severityNumber", .encoding = .value16, .format = .signed_int };
-        count += 1;
-
-        if (options.severity_text) {
-            fields[count] = .{ .name = "severityText", .encoding = .string_length16_char8 };
-            count += 1;
-        }
-        if (options.event_id_attribute != null) {
-            fields[count] = .{ .name = "eventId", .encoding = .value64, .format = .signed_int };
-            count += 1;
-        }
-
-        const result = fields[0..count].*;
-        return &result;
-    }
-}
-
-fn partCFields(comptime options: Options) []const eh.Field {
-    comptime {
-        var fields: [options.attributes.len + options.resource_attributes.len]eh.Field = undefined;
-        var count: usize = 0;
-
-        for (options.attributes) |declared| {
-            fields[count] = .{
-                .name = declared.fieldName(),
-                .encoding = declared.type.encoding(),
-                .format = declared.type.format(),
-            };
-            count += 1;
-        }
-        for (options.resource_attributes) |declared| {
-            fields[count] = .{
-                .name = declared.fieldName(),
-                .encoding = declared.type.encoding(),
-                .format = declared.type.format(),
-            };
-            count += 1;
-        }
-
-        const result = fields[0..count].*;
-        return &result;
     }
 }
 
@@ -1185,7 +1104,7 @@ test "the exporter stays inert when user_events is unavailable" {
     const exporter = try TestExporter.init(std.testing.allocator, null);
     defer exporter.deinit();
 
-    try std.testing.expect(!exporter.data_file.isOpen());
+    try std.testing.expect(!exporter.provider.isOpen());
     for (1..25) |severity| {
         try std.testing.expect(!exporter.isEnabled(@intCast(severity)));
     }
@@ -1237,15 +1156,15 @@ test "RFC 3339 timestamps use only the fractional digits that are present" {
 }
 
 test "oversized strings are truncated on a UTF-8 boundary" {
-    try std.testing.expectEqualStrings("abc", truncateUtf8("abc", 8));
-    try std.testing.expectEqualStrings("abc", truncateUtf8("abc", 3));
-    try std.testing.expectEqualStrings("ab", truncateUtf8("abc", 2));
+    try std.testing.expectEqualStrings("abc", ue.event.truncateUtf8("abc", 8));
+    try std.testing.expectEqualStrings("abc", ue.event.truncateUtf8("abc", 3));
+    try std.testing.expectEqualStrings("ab", ue.event.truncateUtf8("abc", 2));
 
     // "é" is two bytes, so a limit that would split it drops the whole sequence.
-    try std.testing.expectEqualStrings("a", truncateUtf8("aé", 2));
-    try std.testing.expectEqualStrings("aé", truncateUtf8("aé", 3));
+    try std.testing.expectEqualStrings("a", ue.event.truncateUtf8("aé", 2));
+    try std.testing.expectEqualStrings("aé", ue.event.truncateUtf8("aé", 3));
     // "€" is three bytes.
-    try std.testing.expectEqualStrings("", truncateUtf8("€", 2));
+    try std.testing.expectEqualStrings("", ue.event.truncateUtf8("€", 2));
 }
 
 test "a string longer than the payload budget is truncated rather than dropped" {

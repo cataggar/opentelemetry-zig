@@ -47,11 +47,16 @@ pub const abi = @import("user_events/abi.zig");
 /// serialization, and the payload accounting that sizes the write buffers.
 pub const eventheader = @import("user_events/eventheader.zig");
 
-const event_mod = @import("user_events/event.zig");
+/// Comptime schema derivation, the payload encoder, and the tracepoint types.
+pub const event = @import("user_events/event.zig");
+
+const event_mod = event;
 
 /// Declares a tracepoint from a `Config` and a struct type describing its
 /// payload. This is the entry point for most callers.
 pub const Event = event_mod.Event;
+/// Declares one schema emitted at every level, with the level chosen per write.
+pub const LeveledEvent = event_mod.LeveledEvent;
 /// Identity of an event: provider, name, level, and keyword.
 pub const Config = event_mod.Config;
 /// Wraps an integer field so decoders render it as hexadecimal.
