@@ -47,6 +47,18 @@ pub const abi = @import("user_events/abi.zig");
 /// serialization, and the payload accounting that sizes the write buffers.
 pub const eventheader = @import("user_events/eventheader.zig");
 
+const event_mod = @import("user_events/event.zig");
+
+/// Declares a tracepoint from a `Config` and a struct type describing its
+/// payload. This is the entry point for most callers.
+pub const Event = event_mod.Event;
+/// Identity of an event: provider, name, level, and keyword.
+pub const Config = event_mod.Config;
+/// Wraps an integer field so decoders render it as hexadecimal.
+pub const Hex = event_mod.Hex;
+/// Owns the `user_events_data` descriptor shared by a process's tracepoints.
+pub const Provider = @import("user_events/provider.zig").Provider;
+
 /// Severity of an event, used to pick which tracepoint carries it.
 pub const Level = eventheader.Level;
 /// How a field's bytes are laid out in the payload.
@@ -59,5 +71,6 @@ test {
     if (builtin.os.tag == .linux) {
         _ = @import("user_events/abi.zig");
         _ = @import("user_events/eventheader.zig");
+        _ = @import("user_events/event.zig");
     }
 }
