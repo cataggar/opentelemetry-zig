@@ -116,6 +116,44 @@ level a given severity maps to. Emitting while disabled is already nearly free,
 so this check is only worth making when building the attribute values
 themselves is expensive.
 
+## Multiple event schemas
+
+One exporter is one provider and one event name. To emit different attribute
+sets, declare a separate exporter per call site rather than widening a single
+schema to the union of everything:
+
+```zig
+const CheckoutLogs = sdk.logs.UserEventsExporter(.{
+    .provider_name = "myapp_checkout",
+    .event_name = "CheckoutLog",
+    .attributes = &.{.{ .key = "user.id", .type = .int }},
+});
+
+const DbLogs = sdk.logs.UserEventsExporter(.{
+    .provider_name = "myapp_db",
+    .event_name = "DbLog",
+    .attributes = &.{.{ .key = "db.statement", .type = .string }},
+});
+```
+
+`LoggerProvider` hands every record to every registered processor, so attaching
+both exporters directly would make each encode every record and drop the
+attributes it did not declare. Wrap them in `ScopeFilterProcessor` to route by
+instrumentation scope:
+
+```zig
+var checkout_simple = sdk.logs.SimpleLogRecordProcessor.init(io, checkout_exporter.logRecordExporter());
+var checkout_filtered = sdk.logs.ScopeFilterProcessor.init(
+    checkout_simple.asLogRecordProcessor(),
+    .{ .names = &.{"checkout"} },
+);
+try provider.addLogRecordProcessor(checkout_filtered.asLogRecordProcessor());
+```
+
+Records emitted through `provider.getLogger(.{ .name = "checkout" })` then reach
+only `CheckoutLogs`. `ScopeFilterProcessor` also matches on a name prefix or an
+arbitrary predicate.
+
 ## Wire format
 
 Fields are emitted in the order `__csver__`, PartA, PartC, PartB. PartC comes

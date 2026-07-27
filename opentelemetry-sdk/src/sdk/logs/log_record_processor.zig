@@ -377,6 +377,103 @@ pub const BatchingLogRecordProcessor = struct {
     }
 };
 
+/// Forwards records to another processor only when their instrumentation scope
+/// matches, so one `LoggerProvider` can feed several exporters that each want a
+/// different subset of records.
+///
+/// `LoggerProvider.emit` hands every record to every registered processor. That
+/// is what the spec requires, but it means an exporter with a fixed schema — the
+/// `user_events` exporter, say — would otherwise encode records it was never
+/// meant to see and silently drop the attributes it did not declare. Wrapping
+/// each exporting processor here restores per-scope routing without changing the
+/// mandated fan-out: a processor is always free to do nothing.
+///
+/// ```zig
+/// var simple = SimpleLogRecordProcessor.init(io, checkout_exporter);
+/// var filtered = ScopeFilterProcessor.init(
+///     simple.asLogRecordProcessor(),
+///     .{ .names = &.{"checkout"} },
+/// );
+/// try provider.addLogRecordProcessor(filtered.asLogRecordProcessor());
+/// ```
+///
+/// The wrapper must outlive the provider and stay at a stable address, the same
+/// contract the processors it wraps already have.
+pub const ScopeFilterProcessor = struct {
+    inner: LogRecordProcessor,
+    filter: Filter,
+
+    const Self = @This();
+
+    /// How a scope is matched. All variants compare against the scope name.
+    pub const Filter = union(enum) {
+        /// Matches when the scope name equals one of these exactly.
+        names: []const []const u8,
+        /// Matches when the scope name starts with this prefix, which suits
+        /// hierarchical names like `myapp.db.pool`.
+        name_prefix: []const u8,
+        /// Matches when the function returns true. Use for anything the other
+        /// variants cannot express, such as matching on scope attributes.
+        predicate: *const fn (scope: InstrumentationScope) bool,
+    };
+
+    pub fn init(inner: LogRecordProcessor, filter: Filter) Self {
+        return .{ .inner = inner, .filter = filter };
+    }
+
+    pub fn asLogRecordProcessor(self: *Self) LogRecordProcessor {
+        return LogRecordProcessor{
+            .ptr = self,
+            .vtable = &.{
+                .onEmitFn = onEmit,
+                .shutdownFn = shutdown,
+                .forceFlushFn = forceFlush,
+                .enabledFn = enabled,
+            },
+        };
+    }
+
+    pub fn matches(self: *const Self, scope: InstrumentationScope) bool {
+        return switch (self.filter) {
+            .names => |names| for (names) |name| {
+                if (std.mem.eql(u8, scope.name, name)) break true;
+            } else false,
+            .name_prefix => |prefix| std.mem.startsWith(u8, scope.name, prefix),
+            .predicate => |predicate| predicate(scope),
+        };
+    }
+
+    fn onEmit(ctx: *anyopaque, log_record: *logs.ReadWriteLogRecord, parent_context: context.Context) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.matches(log_record.scope)) return;
+        self.inner.onEmit(log_record, parent_context);
+    }
+
+    /// Always delegates. The inner processor owns the exporter and has to be
+    /// torn down even if it never received a record.
+    fn shutdown(ctx: *anyopaque) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.inner.shutdown();
+    }
+
+    /// Always delegates, because a batching inner processor may still hold
+    /// records that matched earlier.
+    fn forceFlush(ctx: *anyopaque) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.inner.forceFlush();
+    }
+
+    /// `Logger.enabled` ORs across processors, so reporting false for a scope
+    /// this processor filters out lets a logger no exporter wants answer false
+    /// overall, making `enabled` a usable guard against building expensive
+    /// records.
+    fn enabled(ctx: *anyopaque, params: EnabledParameters) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.matches(params.scope)) return false;
+        return self.inner.enabled(params);
+    }
+};
+
 test "SimpleLogRecordProcessor basic functionality" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -722,4 +819,232 @@ test "LogRecordQueue wrap-around split" {
     try std.testing.expectEqual(@as(u64, 3), batch[0].observed_timestamp);
     try std.testing.expectEqual(@as(u64, 4), batch[1].observed_timestamp);
     try std.testing.expectEqual(@as(u64, 5), batch[2].observed_timestamp);
+}
+
+/// Counts what reached the exporter and whether the processor was torn down,
+/// which is all the ScopeFilterProcessor tests need to observe.
+const RecordingProcessor = struct {
+    emitted: std.ArrayList(logs.ReadableLogRecord) = .empty,
+    allocator: std.mem.Allocator,
+    shutdown_count: usize = 0,
+    flush_count: usize = 0,
+    enabled_result: bool = true,
+
+    fn deinit(self: *RecordingProcessor) void {
+        self.emitted.deinit(self.allocator);
+    }
+
+    fn asLogRecordProcessor(self: *RecordingProcessor) LogRecordProcessor {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .onEmitFn = onEmit,
+                .shutdownFn = shutdown,
+                .forceFlushFn = forceFlush,
+                .enabledFn = enabled,
+            },
+        };
+    }
+
+    fn onEmit(ctx: *anyopaque, log_record: *logs.ReadWriteLogRecord, _: context.Context) void {
+        const self: *RecordingProcessor = @ptrCast(@alignCast(ctx));
+        self.emitted.append(self.allocator, log_record.asReadable()) catch unreachable;
+    }
+
+    fn shutdown(ctx: *anyopaque) anyerror!void {
+        const self: *RecordingProcessor = @ptrCast(@alignCast(ctx));
+        self.shutdown_count += 1;
+    }
+
+    fn forceFlush(ctx: *anyopaque) anyerror!void {
+        const self: *RecordingProcessor = @ptrCast(@alignCast(ctx));
+        self.flush_count += 1;
+    }
+
+    fn enabled(ctx: *anyopaque, _: EnabledParameters) bool {
+        const self: *RecordingProcessor = @ptrCast(@alignCast(ctx));
+        return self.enabled_result;
+    }
+};
+
+fn recordFor(scope_name: []const u8) logs.ReadWriteLogRecord {
+    return .{
+        .scope = .{ .name = scope_name },
+        .observed_timestamp = 0,
+        .body = scope_name,
+        .severity_number = 9,
+    };
+}
+
+test "ScopeFilterProcessor forwards only matching scopes" {
+    const allocator = std.testing.allocator;
+
+    var recorder = RecordingProcessor{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var filter = ScopeFilterProcessor.init(
+        recorder.asLogRecordProcessor(),
+        .{ .names = &.{ "checkout", "cart" } },
+    );
+    const processor = filter.asLogRecordProcessor();
+    const ctx = context.Context.init();
+
+    for ([_][]const u8{ "checkout", "db", "cart", "http" }) |scope_name| {
+        var log_record = recordFor(scope_name);
+        defer log_record.deinit(allocator);
+        processor.onEmit(&log_record, ctx);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), recorder.emitted.items.len);
+    try std.testing.expectEqualStrings("checkout", recorder.emitted.items[0].scope.name);
+    try std.testing.expectEqualStrings("cart", recorder.emitted.items[1].scope.name);
+}
+
+test "ScopeFilterProcessor matches on a name prefix" {
+    const allocator = std.testing.allocator;
+
+    var recorder = RecordingProcessor{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var filter = ScopeFilterProcessor.init(
+        recorder.asLogRecordProcessor(),
+        .{ .name_prefix = "myapp.db" },
+    );
+    const processor = filter.asLogRecordProcessor();
+    const ctx = context.Context.init();
+
+    for ([_][]const u8{ "myapp.db.pool", "myapp.db", "myapp.http", "db" }) |scope_name| {
+        var log_record = recordFor(scope_name);
+        defer log_record.deinit(allocator);
+        processor.onEmit(&log_record, ctx);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), recorder.emitted.items.len);
+    try std.testing.expectEqualStrings("myapp.db.pool", recorder.emitted.items[0].scope.name);
+    try std.testing.expectEqualStrings("myapp.db", recorder.emitted.items[1].scope.name);
+}
+
+test "ScopeFilterProcessor matches with a custom predicate" {
+    const allocator = std.testing.allocator;
+
+    var recorder = RecordingProcessor{ .allocator = allocator };
+    defer recorder.deinit();
+
+    const versioned = struct {
+        fn only(scope: InstrumentationScope) bool {
+            return scope.version != null;
+        }
+    }.only;
+
+    var filter = ScopeFilterProcessor.init(
+        recorder.asLogRecordProcessor(),
+        .{ .predicate = versioned },
+    );
+    const processor = filter.asLogRecordProcessor();
+    const ctx = context.Context.init();
+
+    var with_version: logs.ReadWriteLogRecord = .{
+        .scope = .{ .name = "checkout", .version = "1.0.0" },
+        .observed_timestamp = 0,
+    };
+    defer with_version.deinit(allocator);
+    var without_version = recordFor("cart");
+    defer without_version.deinit(allocator);
+
+    processor.onEmit(&with_version, ctx);
+    processor.onEmit(&without_version, ctx);
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.emitted.items.len);
+    try std.testing.expectEqualStrings("checkout", recorder.emitted.items[0].scope.name);
+}
+
+test "ScopeFilterProcessor always delegates shutdown and forceFlush" {
+    const allocator = std.testing.allocator;
+
+    var recorder = RecordingProcessor{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var filter = ScopeFilterProcessor.init(
+        recorder.asLogRecordProcessor(),
+        .{ .names = &.{"never-matches"} },
+    );
+    const processor = filter.asLogRecordProcessor();
+
+    var log_record = recordFor("checkout");
+    defer log_record.deinit(allocator);
+    processor.onEmit(&log_record, context.Context.init());
+
+    // Nothing matched, yet the inner processor still owns an exporter that has
+    // to be flushed and shut down.
+    try std.testing.expectEqual(@as(usize, 0), recorder.emitted.items.len);
+    try processor.forceFlush();
+    try processor.shutdown();
+    try std.testing.expectEqual(@as(usize, 1), recorder.flush_count);
+    try std.testing.expectEqual(@as(usize, 1), recorder.shutdown_count);
+}
+
+test "ScopeFilterProcessor reports enabled only for matching scopes" {
+    const allocator = std.testing.allocator;
+
+    var recorder = RecordingProcessor{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var filter = ScopeFilterProcessor.init(
+        recorder.asLogRecordProcessor(),
+        .{ .names = &.{"checkout"} },
+    );
+    const processor = filter.asLogRecordProcessor();
+
+    try std.testing.expect(processor.enabled(.{
+        .scope = .{ .name = "checkout" },
+        .context = context.Context.init(),
+    }));
+    try std.testing.expect(!processor.enabled(.{
+        .scope = .{ .name = "db" },
+        .context = context.Context.init(),
+    }));
+
+    // A matching scope still defers to the inner processor.
+    recorder.enabled_result = false;
+    try std.testing.expect(!processor.enabled(.{
+        .scope = .{ .name = "checkout" },
+        .context = context.Context.init(),
+    }));
+}
+
+test "ScopeFilterProcessor routes each scope to its own exporter" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var checkout_recorder = RecordingProcessor{ .allocator = allocator };
+    defer checkout_recorder.deinit();
+    var db_recorder = RecordingProcessor{ .allocator = allocator };
+    defer db_recorder.deinit();
+
+    var checkout_filter = ScopeFilterProcessor.init(
+        checkout_recorder.asLogRecordProcessor(),
+        .{ .names = &.{"checkout"} },
+    );
+    var db_filter = ScopeFilterProcessor.init(
+        db_recorder.asLogRecordProcessor(),
+        .{ .names = &.{"db"} },
+    );
+
+    var provider = try logs.LoggerProvider.init(allocator, io, null);
+    defer provider.deinit();
+    try provider.addLogRecordProcessor(checkout_filter.asLogRecordProcessor());
+    try provider.addLogRecordProcessor(db_filter.asLogRecordProcessor());
+
+    const checkout_logger = try provider.getLogger(.{ .name = "checkout" });
+    const db_logger = try provider.getLogger(.{ .name = "db" });
+
+    checkout_logger.emit(.info, "order placed", .{});
+    db_logger.emit(.info, "query executed", .{});
+    db_logger.emit(.warn, "slow query", .{});
+
+    try std.testing.expectEqual(@as(usize, 1), checkout_recorder.emitted.items.len);
+    try std.testing.expectEqualStrings("order placed", checkout_recorder.emitted.items[0].body.?);
+    try std.testing.expectEqual(@as(usize, 2), db_recorder.emitted.items.len);
+    try std.testing.expectEqualStrings("query executed", db_recorder.emitted.items[0].body.?);
+    try std.testing.expectEqualStrings("slow query", db_recorder.emitted.items[1].body.?);
 }
