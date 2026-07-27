@@ -240,6 +240,17 @@ pub fn UserEventsExporter(comptime options: Options) type {
             return self.tracepointFor(levelFromSeverity(severity_number)).isEnabled();
         }
 
+        /// True when at least one tracepoint reached the kernel. Registration
+        /// is best effort, so this reports whether the exporter can emit at
+        /// all, independently of whether anything is currently listening.
+        pub fn isRegistered(self: *const Self) bool {
+            if (self.is_shutdown) return false;
+            for (&self.tracepoints) |*tracepoint| {
+                if (tracepoint.isRegistered()) return true;
+            }
+            return false;
+        }
+
         fn tracepointFor(self: *const Self, level: eh.Level) *const abi.Tracepoint {
             return &self.tracepoints[level.toInt() - 1];
         }
