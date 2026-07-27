@@ -25,8 +25,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const abi = @import("user_events/abi.zig");
-const eh = @import("user_events/eventheader.zig");
+const abi = @import("user_events").abi;
+const eh = @import("user_events").eventheader;
 
 const logs = @import("../../../api/logs/logger_provider.zig");
 const Attribute = @import("../../../attributes.zig").Attribute;

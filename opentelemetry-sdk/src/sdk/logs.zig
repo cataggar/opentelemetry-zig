@@ -23,8 +23,10 @@ pub const OTLPExporter = @import("logs/exporters/otlp.zig").OTLPExporter;
 
 // Linux user_events exporter. `UserEventsExporter` is a generic over a
 // comptime-declared schema; see the module docs for the available options.
-pub const user_events = @import("logs/exporters/user_events.zig");
-pub const UserEventsExporter = user_events.UserEventsExporter;
+// The tracepoint layer it sits on is the standalone `user_events` module,
+// re-exported as `sdk.user_events` for direct use without the logs SDK.
+pub const user_events_exporter = @import("logs/exporters/user_events.zig");
+pub const UserEventsExporter = user_events_exporter.UserEventsExporter;
 
 // std.log bridge
 pub const std_log_bridge = @import("logs/std_log_bridge.zig");
@@ -38,7 +40,5 @@ test {
     _ = @import("logs/concurrency_test.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("logs/exporters/user_events.zig");
-        _ = @import("logs/exporters/user_events/abi.zig");
-        _ = @import("logs/exporters/user_events/eventheader.zig");
     }
 }

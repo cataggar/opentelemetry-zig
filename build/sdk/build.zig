@@ -51,10 +51,21 @@ fn modules(b: *std.Build, info: CompilationInfo, dependencies: *BuildModules) !v
     });
     try dependencies.put("clock", clock_mod);
 
+    // Linux `user_events` tracepoints. Published as its own module so projects
+    // that only want tracepoints can depend on it without the OpenTelemetry SDK.
+    const user_events_mod = b.addModule("user_events", .{
+        .root_source_file = b.path(sdk_root ++ "/src/user_events.zig"),
+        .target = info.target,
+        .optimize = info.optimize,
+        .link_libc = true,
+    });
+    try dependencies.put("user_events", user_events_mod);
+
     var sdk_dep_names = [_][]const u8{
         "protobuf",
         "opentelemetry-proto",
         "clock",
+        "user_events",
     };
     const sdk_mod = b.addModule("sdk", .{
         .root_source_file = b.path(sdk_root ++ "/src/sdk.zig"),
@@ -126,6 +137,18 @@ fn addTestStep(b: *std.Build, mods: *const BuildModules) !*std.Build.Step {
 
     const run_sdk_unit_tests = b.addRunArtifact(sdk_unit_tests);
     step.dependOn(&run_sdk_unit_tests.step);
+
+    // The `user_events` module is standalone, so its tests need their own
+    // artifact: `zig test` only collects tests from the root module.
+    const user_events_tests = b.addTest(.{
+        .root_module = mods.get("user_events") orelse return BuildError.ModuleNotFound,
+        .test_runner = .{ .path = b.path(sdk_root ++ "/src/test_runner.zig"), .mode = .simple },
+        .filters = b.args orelse &[0][]const u8{},
+    });
+    user_events_tests.root_module.addOptions("test_options", test_options);
+
+    const run_user_events_tests = b.addRunArtifact(user_events_tests);
+    step.dependOn(&run_user_events_tests.step);
 
     return step;
 }
@@ -280,6 +303,7 @@ fn addDocsStep(b: *std.Build, mods: *const BuildModules, info: CompilationInfo) 
         "protobuf",
         "opentelemetry-proto",
         "clock",
+        "user_events",
     };
 
     const sdk_docs = b.addObject(.{
@@ -332,6 +356,7 @@ fn buildExamples(
                 "otlp-stub",
                 "opentelemetry-proto",
                 "clock",
+                "user_events",
             };
 
             const b_mod = b.createModule(.{
@@ -414,6 +439,7 @@ fn buildIntegrationTests(
 ) ![]*std.Build.Step.Compile {
     const otel_mod = mods.get("opentelemetry-sdk") orelse return BuildError.ModuleNotFound;
     const clock_mod = mods.get("clock") orelse return BuildError.ModuleNotFound;
+    const user_events_mod = mods.get("user_events") orelse return BuildError.ModuleNotFound;
 
     var integration_tests: std.ArrayList(*std.Build.Step.Compile) = .empty;
     errdefer integration_tests.deinit(b.allocator);
@@ -430,6 +456,7 @@ fn buildIntegrationTests(
     var dep_names = [_][]const u8{
         "opentelemetry-sdk",
         "clock",
+        "user_events",
     };
     const common_mod = b.createModule(.{
         .root_source_file = common_path,
@@ -459,6 +486,7 @@ fn buildIntegrationTests(
                                 .{ .name = "opentelemetry-sdk", .module = otel_mod },
                                 .{ .name = "common", .module = common_mod },
                                 .{ .name = "clock", .module = clock_mod },
+                                .{ .name = "user_events", .module = user_events_mod },
                             },
                         });
 
@@ -477,6 +505,7 @@ fn buildIntegrationTests(
                         .{ .name = "opentelemetry-sdk", .module = otel_mod },
                         .{ .name = "common", .module = common_mod },
                         .{ .name = "clock", .module = clock_mod },
+                        .{ .name = "user_events", .module = user_events_mod },
                     },
                 });
 
