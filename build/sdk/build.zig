@@ -158,7 +158,7 @@ fn addExamplesStep(b: *std.Build, mods: *const BuildModules, info: CompilationIn
     const step = b.step("sdk-examples", "Build and run all SDK examples");
     const examples_filter = b.option([]const u8, "examples-filter", "Filter examples to build");
 
-    const examples_dirs: []const []const u8 = &.{ "metrics", "trace", "logs", "baggage", "propagation" };
+    const examples_dirs: []const []const u8 = &.{ "metrics", "trace", "logs", "baggage", "propagation", "tracepoints" };
     for (examples_dirs) |example_dir| {
         const example = buildExamples(
             b,

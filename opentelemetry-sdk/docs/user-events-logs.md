@@ -16,6 +16,12 @@ single relaxed load of the enablement word.
 
 Requires Linux 6.4 or newer with `CONFIG_USER_EVENTS=y` and a mounted tracefs.
 
+The exporter is a thin adapter: it maps a log record onto the Common Schema
+field layout and hands it to `user_events.LeveledEvent` from the standalone
+[`user_events` module](./user-events.md), which owns the tracepoint registration
+and the EventHeader encoding. If you want Linux tracepoints without
+OpenTelemetry, depend on that module directly.
+
 ## Declaring the schema
 
 The schema is comptime. `UserEventsExporter` is a generic whose argument names
@@ -192,6 +198,12 @@ place, and the whole event goes out as one `writev`. Both buffers live in a
 caller-owned `EventBuffers` struct because the iovecs point into them and must
 outlive the function that fills them.
 
+The Common Schema layout above is synthesized at comptime into a plain Zig
+struct type, and the encoding is then derived from that type by the
+[`user_events` module](./user-events.md). The per-type encodings are documented
+there; the mapping from `AttributeType` is `.string` → `[]const u8`, `.int` →
+`i64`, `.double` → `f64`, `.bool` → `bool`.
+
 A `user_events` event cannot exceed 64 KiB. Rather than drop an oversized
 record, the encoder gives strings a shared budget and truncates on a UTF-8
 boundary, so a long body degrades instead of vanishing.
@@ -226,3 +238,6 @@ OpenTelemetry Collector's `user_events` receiver.
 See [`examples/logs/user_events.zig`](../examples/logs/user_events.zig). It runs
 unprivileged and reports that it could not register, which is the behaviour
 worth seeing.
+
+[`examples/tracepoints/user_events.zig`](../examples/tracepoints/user_events.zig)
+is the same idea one layer down, using only the `user_events` module.
