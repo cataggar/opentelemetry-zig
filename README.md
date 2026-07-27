@@ -138,6 +138,45 @@ crate.
 See [docs/user-events-logs.md](./opentelemetry-sdk/docs/user-events-logs.md) and
 [examples/logs/user_events.zig](./opentelemetry-sdk/examples/logs/user_events.zig).
 
+### Linux `user_events` Tracepoints
+
+The tracepoint layer the exporter is built on ships as its own module, with no
+dependency on OpenTelemetry. Use it when you want Linux tracepoints without
+logs. An event is a struct type; the wire schema is derived from it at comptime,
+so `write` is type-checked and never allocates.
+
+```zig
+exe.root_module.addImport("user_events", otel.module("user_events"));
+```
+
+```zig
+const user_events = @import("user_events");
+
+const Checkout = user_events.Event(.{
+    .provider = "myapp",
+    .name = "Checkout",
+    .level = .informational,
+    .keyword = 1,
+}, struct {
+    order_id: u64,
+    route: []const u8,
+    cache_hit: bool,
+});
+
+var provider: user_events.Provider = .{};
+_ = provider.openBestEffort();
+defer provider.close();
+
+var checkout: Checkout = .{};
+checkout.registerBestEffort(&provider);
+defer checkout.unregister(&provider);
+
+try checkout.write(.{ .order_id = 42, .route = "/api/checkout", .cache_hit = true });
+```
+
+See [docs/user-events.md](./opentelemetry-sdk/docs/user-events.md) and
+[examples/tracepoints/user_events.zig](./opentelemetry-sdk/examples/tracepoints/user_events.zig).
+
 ## C Language Bindings
 
 The SDK provides C-compatible bindings, allowing C programs to use OpenTelemetry instrumentation. The C API covers all three signals: Traces, Metrics, and Logs.
