@@ -20,6 +20,11 @@ pub const StdoutExporter = @import("logs/exporters/generic.zig").StdoutExporter;
 pub const InMemoryExporter = @import("logs/exporters/generic.zig").InMemoryExporter;
 pub const OTLPExporter = @import("logs/exporters/otlp.zig").OTLPExporter;
 
+// Linux user_events exporter. `UserEventsExporter` is a generic over a
+// comptime-declared schema; see the module docs for the available options.
+pub const user_events = @import("logs/exporters/user_events.zig");
+pub const UserEventsExporter = user_events.UserEventsExporter;
+
 // std.log bridge
 pub const std_log_bridge = @import("logs/std_log_bridge.zig");
 
@@ -31,6 +36,7 @@ test {
     _ = @import("logs/std_log_bridge.zig");
     _ = @import("logs/concurrency_test.zig");
     if (builtin.os.tag == .linux) {
+        _ = @import("logs/exporters/user_events.zig");
         _ = @import("logs/exporters/user_events/abi.zig");
         _ = @import("logs/exporters/user_events/eventheader.zig");
     }
