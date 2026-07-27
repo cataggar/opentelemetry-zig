@@ -13,6 +13,7 @@ pub const ReadbleLogRecord = @import("../api/logs/logger_provider.zig").Readable
 pub const LogRecordProcessor = @import("logs/log_record_processor.zig").LogRecordProcessor;
 pub const SimpleLogRecordProcessor = @import("logs/log_record_processor.zig").SimpleLogRecordProcessor;
 pub const BatchingLogRecordProcessor = @import("logs/log_record_processor.zig").BatchingLogRecordProcessor;
+pub const ScopeFilterProcessor = @import("logs/log_record_processor.zig").ScopeFilterProcessor;
 
 // Exporters
 pub const LogRecordExporter = @import("logs/log_record_exporter.zig").LogRecordExporter;
