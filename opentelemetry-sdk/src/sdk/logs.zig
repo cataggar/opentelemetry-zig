@@ -32,5 +32,6 @@ test {
     _ = @import("logs/concurrency_test.zig");
     if (builtin.os.tag == .linux) {
         _ = @import("logs/exporters/user_events/abi.zig");
+        _ = @import("logs/exporters/user_events/eventheader.zig");
     }
 }
