@@ -68,6 +68,61 @@ pub fn Hex(comptime T: type) type {
     };
 }
 
+/// Number of EventHeader levels; a multi-level event owns one tracepoint each.
+pub const level_count = 5;
+
+/// Levels ordered by their integer value, so `levels[level.toInt() - 1]` is
+/// that level.
+pub const levels = [level_count]eh.Level{
+    .critical_error,
+    .err,
+    .warning,
+    .informational,
+    .verbose,
+};
+
+/// Metadata and encoding for one payload type. Shared by `Event` and
+/// `LeveledEvent`, which differ only in how many tracepoints they own: the
+/// level lives in the 8 header bytes, never in the metadata.
+fn Codec(comptime event_name: []const u8, comptime Fields: type) type {
+    const schema = eh.Event{ .name = event_name, .fields = comptime deriveFields(Fields) };
+    const Def = eh.Definition(schema);
+
+    if (Def.fixed_payload_bytes > Def.max_payload_bytes) {
+        @compileError("user_events event '" ++ event_name ++
+            "' declares more fixed payload bytes than an event can carry");
+    }
+
+    return struct {
+        pub const definition = Def;
+
+        /// Scratch space one `write` needs. Exposed so callers that encode
+        /// without emitting can supply their own.
+        pub const Buffers = struct {
+            header: [eh.header_size]u8 = undefined,
+            scratch: [Def.fixed_payload_bytes]u8 = undefined,
+            vectors: [Def.max_iovecs]abi.Iovec = undefined,
+        };
+
+        pub fn encode(level: eh.Level, values: Fields, buffers: *Buffers) []abi.Iovec {
+            buffers.header = eh.headerBytes(level);
+
+            var writer = Writer(Def){
+                .scratch = &buffers.scratch,
+                .vectors = &buffers.vectors,
+                .string_budget = Def.max_payload_bytes - Def.fixed_payload_bytes,
+            };
+
+            writer.reserveWriteIndex();
+            writer.putStatic(&buffers.header);
+            writer.putStatic(&Def.metadata_extension);
+            writer.putStruct(Fields, values);
+
+            return writer.finish();
+        }
+    };
+}
+
 /// Declares a tracepoint whose payload is described by the struct type `Fields`.
 ///
 /// Field types map onto EventHeader encodings as follows:
@@ -86,20 +141,15 @@ pub fn Hex(comptime T: type) type {
 /// The returned type owns its `abi.Tracepoint`, which the kernel holds a
 /// pointer to. Store it somewhere stable (a global, or a field of a
 /// heap-allocated struct) and do not copy or move it while registered.
+///
+/// Use `LeveledEvent` instead when one schema is emitted at several severities.
 pub fn Event(comptime config: Config, comptime Fields: type) type {
     if (builtin.os.tag != .linux) {
         @compileError("user_events.Event requires Linux: user_events is a Linux kernel feature");
     }
 
     comptime validateConfig(config);
-
-    const schema = eh.Event{ .name = config.name, .fields = comptime deriveFields(Fields) };
-    const Def = eh.Definition(schema);
-
-    if (Def.fixed_payload_bytes > Def.max_payload_bytes) {
-        @compileError("user_events event '" ++ config.name ++
-            "' declares more fixed payload bytes than an event can carry");
-    }
+    const codec = Codec(config.name, Fields);
 
     return struct {
         const Self = @This();
@@ -109,21 +159,15 @@ pub fn Event(comptime config: Config, comptime Fields: type) type {
         /// The struct type describing this event's payload.
         pub const Payload = Fields;
         /// EventHeader metadata and payload accounting for this schema.
-        pub const definition = Def;
+        pub const definition = codec.definition;
+        /// Scratch space one `write` needs.
+        pub const Buffers = codec.Buffers;
         /// Tracepoint name as it appears under
         /// `/sys/kernel/tracing/events/user_events/`.
-        pub const tracepoint_name: [:0]const u8 = tracepointName(config);
+        pub const tracepoint_name: [:0]const u8 = tracepointName(config.provider, config.level, config.keyword);
         /// Tracepoint name plus the field declaration passed to the kernel at
         /// registration.
         pub const name_args: [:0]const u8 = tracepoint_name ++ " " ++ registration_schema;
-
-        /// Scratch space one `write` needs. Exposed so callers that encode
-        /// without emitting can supply their own.
-        pub const Buffers = struct {
-            header: [eh.header_size]u8 = undefined,
-            scratch: [Def.fixed_payload_bytes]u8 = undefined,
-            vectors: [Def.max_iovecs]abi.Iovec = undefined,
-        };
 
         /// Registers the tracepoint with the kernel. The event stays inert
         /// until a listener enables it.
@@ -170,12 +214,7 @@ pub fn Event(comptime config: Config, comptime Fields: type) type {
             if (!self.isEnabled()) return;
 
             var buffers: Buffers = .{};
-            const vectors = encode(values, &buffers);
-            self.tracepoint.writev(vectors) catch |err| switch (err) {
-                // The listener vanished between the enable check and the write.
-                error.NoListener, error.NotRegistered => return,
-                else => return err,
-            };
+            return submit(&self.tracepoint, encode(values, &buffers));
         }
 
         /// Encodes `values` into `buffers` and returns the vectors to submit.
@@ -184,21 +223,132 @@ pub fn Event(comptime config: Config, comptime Fields: type) type {
         /// in by the write itself. Exposed so tests and tooling can inspect the
         /// exact bytes without a kernel.
         pub fn encode(values: Fields, buffers: *Buffers) []abi.Iovec {
-            buffers.header = eh.headerBytes(config.level);
-
-            var writer = Writer(Def){
-                .scratch = &buffers.scratch,
-                .vectors = &buffers.vectors,
-                .string_budget = Def.max_payload_bytes - Def.fixed_payload_bytes,
-            };
-
-            writer.reserveWriteIndex();
-            writer.putStatic(&buffers.header);
-            writer.putStatic(&Def.metadata_extension);
-            writer.putStruct(Fields, values);
-
-            return writer.finish();
+            return codec.encode(config.level, values, buffers);
         }
+    };
+}
+
+/// Declares one schema emitted at every EventHeader level.
+///
+/// The level is chosen per write and selects which of the five tracepoints
+/// carries the event, so a listener can collect errors without also collecting
+/// verbose output. The metadata is identical across levels, so all five share
+/// one definition; only the header's level byte differs.
+///
+/// `config.level` is ignored. Like `Event`, the returned type is address-stable
+/// by contract.
+pub fn LeveledEvent(comptime config: Config, comptime Fields: type) type {
+    if (builtin.os.tag != .linux) {
+        @compileError("user_events.LeveledEvent requires Linux: user_events is a Linux kernel feature");
+    }
+
+    comptime for (levels) |level| validateConfig(.{
+        .provider = config.provider,
+        .name = config.name,
+        .level = level,
+        .keyword = config.keyword,
+    });
+
+    const codec = Codec(config.name, Fields);
+
+    return struct {
+        const Self = @This();
+
+        /// Indexed by `level.toInt() - 1`.
+        tracepoints: [level_count]abi.Tracepoint = @splat(.{}),
+
+        pub const Payload = Fields;
+        pub const definition = codec.definition;
+        pub const Buffers = codec.Buffers;
+
+        /// Tracepoint names, indexed by `level.toInt() - 1`.
+        pub const tracepoint_names: [level_count][:0]const u8 = blk: {
+            var names: [level_count][:0]const u8 = undefined;
+            for (levels, 0..) |level, index| {
+                names[index] = tracepointName(config.provider, level, config.keyword);
+            }
+            break :blk names;
+        };
+
+        /// Registration strings, indexed by `level.toInt() - 1`.
+        pub const name_args: [level_count][:0]const u8 = blk: {
+            var args: [level_count][:0]const u8 = undefined;
+            for (tracepoint_names, 0..) |name, index| {
+                args[index] = name ++ " " ++ registration_schema;
+            }
+            break :blk args;
+        };
+
+        /// Registers every level and returns how many the kernel accepted.
+        ///
+        /// Registration is best effort: a level that fails simply stays
+        /// disabled, so partial success is still useful.
+        pub fn register(self: *Self, provider: *const Provider) usize {
+            var registered: usize = 0;
+            for (&self.tracepoints, name_args) |*tracepoint, args| {
+                tracepoint.register(&provider.data_file, args) catch |err| {
+                    log.warn("could not register tracepoint '{s}': {t}", .{ args, err });
+                    continue;
+                };
+                registered += 1;
+            }
+            return registered;
+        }
+
+        /// Unregisters every level. Safe to call when none were registered.
+        pub fn unregister(self: *Self, provider: *const Provider) void {
+            for (&self.tracepoints, tracepoint_names) |*tracepoint, name| {
+                tracepoint.unregister(&provider.data_file) catch |err| {
+                    log.warn("could not unregister tracepoint '{s}': {t}", .{ name, err });
+                };
+            }
+        }
+
+        /// True when any level reached the kernel, independently of whether
+        /// anything is currently listening.
+        pub fn isRegistered(self: *const Self) bool {
+            for (&self.tracepoints) |*tracepoint| {
+                if (tracepoint.isRegistered()) return true;
+            }
+            return false;
+        }
+
+        /// True when a listener is collecting this level.
+        pub fn isEnabled(self: *const Self, level: eh.Level) bool {
+            return self.tracepointFor(level).isEnabled();
+        }
+
+        pub fn tracepointFor(self: *const Self, level: eh.Level) *const abi.Tracepoint {
+            return &self.tracepoints[level.toInt() - 1];
+        }
+
+        /// Emits one event at `level`, or does nothing when nothing is
+        /// collecting that level.
+        pub fn write(self: *const Self, level: eh.Level, values: Fields) abi.WriteError!void {
+            const tracepoint = self.tracepointFor(level);
+            if (!tracepoint.isEnabled()) return;
+
+            var buffers: Buffers = .{};
+            return submit(tracepoint, encode(level, values, &buffers));
+        }
+
+        /// Encodes `values` at `level` into `buffers` and returns the vectors
+        /// to submit. Exposed so tests and tooling can inspect the exact bytes
+        /// without a kernel.
+        pub fn encode(level: eh.Level, values: Fields, buffers: *Buffers) []abi.Iovec {
+            return codec.encode(level, values, buffers);
+        }
+    };
+}
+
+/// Submits an encoded event, treating a vanished listener as success.
+///
+/// A tracepoint can be disabled between the enablement check and the write, and
+/// losing an event nobody was collecting is not an error worth reporting.
+fn submit(tracepoint: *const abi.Tracepoint, vectors: []abi.Iovec) abi.WriteError!void {
+    tracepoint.writev(vectors) catch |err| switch (err) {
+        error.NoListener, error.NotRegistered => return,
+        else => return err,
     };
 }
 
@@ -420,7 +570,7 @@ fn validateConfig(comptime config: Config) void {
             }
         }
 
-        const name = tracepointName(config);
+        const name = tracepointName(config.provider, config.level, config.keyword);
         if (name.len > abi.max_name_len) {
             @compileError("user_events tracepoint name exceeds the kernel limit: '" ++ name ++ "'");
         }
@@ -433,14 +583,12 @@ fn validateConfig(comptime config: Config) void {
 /// Builds the `<provider>_L<level>K<keyword>` name the kernel knows the
 /// tracepoint by. Levels and keywords are lowercase hex without padding, which
 /// is the convention EventHeader decoders expect.
-pub fn tracepointName(comptime config: Config) [:0]const u8 {
-    comptime {
-        return std.fmt.comptimePrint("{s}_L{x}K{x}", .{
-            config.provider,
-            config.level.toInt(),
-            config.keyword,
-        });
-    }
+pub fn tracepointName(
+    comptime provider: []const u8,
+    comptime level: eh.Level,
+    comptime keyword: u64,
+) [:0]const u8 {
+    return std.fmt.comptimePrint("{s}_L{x}K{x}", .{ provider, level.toInt(), keyword });
 }
 
 test {
@@ -613,6 +761,61 @@ test "strings truncate on a UTF-8 boundary rather than dropping the event" {
     try testing.expectEqualStrings("a", truncateUtf8("a€", 2));
     try testing.expectEqualStrings("a€", truncateUtf8("a€", 4));
     try testing.expectEqualStrings("", truncateUtf8("€", 2));
+}
+
+test "a leveled event names one tracepoint per level and shares one schema" {
+    const Log = LeveledEvent(.{ .provider = "myapp", .name = "Log", .keyword = 0x2a }, struct {
+        body: []const u8,
+    });
+
+    try testing.expectEqual(@as(usize, 5), Log.tracepoint_names.len);
+    try testing.expectEqualStrings("myapp_L1K2a", Log.tracepoint_names[0]);
+    try testing.expectEqualStrings("myapp_L4K2a", Log.tracepoint_names[3]);
+    try testing.expectEqualStrings("myapp_L5K2a", Log.tracepoint_names[4]);
+    try testing.expectEqualStrings("myapp_L2K2a " ++ registration_schema, Log.name_args[1]);
+
+    // The level lives in the header, never in the metadata, so every level
+    // decodes against the same schema.
+    const Single = Event(.{ .provider = "myapp", .name = "Log" }, struct { body: []const u8 });
+    try testing.expectEqualSlices(
+        u8,
+        &Single.definition.metadata_extension,
+        &Log.definition.metadata_extension,
+    );
+}
+
+test "a leveled event puts the level in the header and nothing else" {
+    const Log = LeveledEvent(.{ .provider = "myapp", .name = "Log" }, struct { body: []const u8 });
+
+    var warning: Log.Buffers = .{};
+    var verbose: Log.Buffers = .{};
+    const warning_vectors = Log.encode(.warning, .{ .body = "hi" }, &warning);
+    const verbose_vectors = Log.encode(.verbose, .{ .body = "hi" }, &verbose);
+
+    try testing.expectEqual(eh.headerBytes(.warning), warning.header);
+    try testing.expectEqual(eh.headerBytes(.verbose), verbose.header);
+    try testing.expectEqual(warning_vectors.len, verbose_vectors.len);
+
+    // Everything after the header is identical.
+    for (warning_vectors[2..], verbose_vectors[2..]) |a, b| {
+        try testing.expectEqualSlices(u8, a.base[0..a.len], b.base[0..b.len]);
+    }
+}
+
+test "levels are indexed by their integer value" {
+    const Log = LeveledEvent(.{ .provider = "myapp", .name = "Log" }, struct { body: []const u8 });
+
+    var log_event: Log = .{};
+    inline for (levels) |level| {
+        // Nothing is registered, so every level must report itself disabled,
+        // and the lookup must stay in bounds for each of them.
+        try testing.expect(!log_event.isEnabled(level));
+        try testing.expectEqual(
+            &log_event.tracepoints[level.toInt() - 1],
+            log_event.tracepointFor(level),
+        );
+    }
+    try testing.expect(!log_event.isRegistered());
 }
 
 test "an unregistered event neither writes nor reports itself enabled" {
