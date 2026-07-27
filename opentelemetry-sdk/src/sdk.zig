@@ -31,6 +31,11 @@ pub const propagation = @import("sdk/propagation.zig");
 // Direct exports for convenience
 pub const otlp = @import("otlp.zig");
 
+// Linux `user_events` tracepoints. Standalone: this namespace does not depend
+// on the OpenTelemetry SDK, and is also published as its own `user_events`
+// module for projects that want tracepoints without OpenTelemetry.
+pub const user_events = @import("user_events");
+
 // Attribute system exports
 pub const Attribute = @import("attributes.zig").Attribute;
 pub const AttributeValue = @import("attributes.zig").AttributeValue;
