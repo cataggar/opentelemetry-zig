@@ -1,5 +1,7 @@
 //! OpenTelemetry Logs SDK.
 
+const builtin = @import("builtin");
+
 // Logger Provider
 pub const LoggerProvider = @import("../api/logs/logger_provider.zig").LoggerProvider;
 // Logger and associated types
@@ -28,4 +30,7 @@ test {
     _ = @import("logs/exporters/otlp.zig");
     _ = @import("logs/std_log_bridge.zig");
     _ = @import("logs/concurrency_test.zig");
+    if (builtin.os.tag == .linux) {
+        _ = @import("logs/exporters/user_events/abi.zig");
+    }
 }
