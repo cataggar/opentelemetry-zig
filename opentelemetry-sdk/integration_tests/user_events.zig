@@ -98,6 +98,17 @@ pub fn main(init: std.process.Init) !void {
 
     const logger = try provider.getLogger(.{ .name = "integration.user_events", .version = "1.0.0" });
 
+    // The kernel's enablement word must be visible through the API, not just
+    // through the concrete exporter type.
+    if (!logger.enabled(.{ .severity = 9, .context = sdk.api.context.Context.init() })) {
+        std.debug.print("✗ tracepoint is enabled but Logger.enabled() reports false\n", .{});
+        return error.EnabledNotPlumbed;
+    }
+    if (logger.enabled(.{ .severity = 1, .context = sdk.api.context.Context.init() })) {
+        std.debug.print("✗ Logger.enabled() reports true for a level nothing is collecting\n", .{});
+        return error.EnabledTooPermissive;
+    }
+
     const attributes = [_]sdk.attributes.Attribute{
         .{ .key = "user.id", .value = .{ .int = 12345 } },
         .{ .key = "http.route", .value = .{ .string = "/api/checkout" } },

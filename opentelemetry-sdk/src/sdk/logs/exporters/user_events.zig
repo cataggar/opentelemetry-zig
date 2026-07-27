@@ -32,6 +32,7 @@ const logs = @import("../../../api/logs/logger_provider.zig");
 const Attribute = @import("../../../attributes.zig").Attribute;
 const AttributeValue = @import("../../../attributes.zig").AttributeValue;
 const LogRecordExporter = @import("../log_record_exporter.zig").LogRecordExporter;
+const EnabledParameters = @import("../../../api/logs/enabled_parameters.zig").EnabledParameters;
 
 const log = std.log.scoped(.user_events_exporter);
 
@@ -229,8 +230,17 @@ pub fn UserEventsExporter(comptime options: Options) type {
                 .vtable = &.{
                     .exportLogsFn = exportLogsFn,
                     .shutdownFn = shutdownFn,
+                    .enabledFn = enabledFn,
                 },
             };
+        }
+
+        /// Reports the kernel's enablement state through `Logger.enabled`, so a
+        /// caller can skip building a record no listener would collect without
+        /// having to reach for the concrete exporter type.
+        fn enabledFn(ctx: *anyopaque, params: EnabledParameters) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return self.isEnabled(params.severity orelse options.default_severity_number);
         }
 
         /// True when a listener has enabled the tracepoint this severity maps
@@ -1279,4 +1289,34 @@ test "a string longer than the payload budget is truncated rather than dropped" 
 
     const decoded = try decodeEncodedEvent(arena, vectors);
     try std.testing.expect(std.mem.indexOf(u8, decoded, "PartB.body=xxx") != null);
+}
+
+test "exporter reports disabled through the LogRecordExporter interface when unregistered" {
+    const exporter = try TestExporter.init(std.testing.allocator, null);
+    defer exporter.deinit();
+
+    // Registration cannot succeed against a nonexistent data file, so nothing
+    // is listening and Logger.enabled() must be able to see that.
+    try std.testing.expect(!exporter.isRegistered());
+
+    const interface = exporter.logRecordExporter();
+    try std.testing.expect(!interface.enabled(.{
+        .scope = .{ .name = "test" },
+        .severity = 9,
+        .context = @import("../../../api/context.zig").Context.init(),
+    }));
+}
+
+test "exporter enablement falls back to the default severity" {
+    const exporter = try TestExporter.init(std.testing.allocator, null);
+    defer exporter.deinit();
+
+    const interface = exporter.logRecordExporter();
+
+    // A missing severity must not be read as "enabled"; it resolves to the
+    // configured default and is answered from that level's tracepoint.
+    try std.testing.expect(!interface.enabled(.{
+        .scope = .{ .name = "test" },
+        .context = @import("../../../api/context.zig").Context.init(),
+    }));
 }

@@ -112,9 +112,13 @@ listeners enable levels independently. The name encodes the level and keyword:
 you can print exactly what the process will register without registering it.
 
 `exporter.isEnabled(severity_number)` reports whether anything is collecting the
-level a given severity maps to. Emitting while disabled is already nearly free,
-so this check is only worth making when building the attribute values
-themselves is expensive.
+level a given severity maps to. The same answer is available through the API as
+`logger.enabled(.{ .severity = 9, .context = ctx })`, which is usually the better
+call because it does not tie the call site to a concrete exporter type and also
+accounts for scope filtering and provider shutdown.
+
+Emitting while disabled is already nearly free, so this check is only worth
+making when building the attribute values themselves is expensive.
 
 ## Multiple event schemas
 

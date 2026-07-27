@@ -151,9 +151,8 @@ pub const SimpleLogRecordProcessor = struct {
     }
 
     fn enabled(ctx: *anyopaque, params: EnabledParameters) bool {
-        _ = ctx;
-        _ = params;
-        return true;
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.exporter.enabled(params);
     }
 };
 
@@ -365,15 +364,15 @@ pub const BatchingLogRecordProcessor = struct {
 
     fn enabled(ctx: *anyopaque, params: EnabledParameters) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        _ = params;
 
         // Not enabled if shutting down
         if (self.should_shutdown.load(.acquire)) {
             return false;
         }
 
-        // Default to true per spec (even if queue might be full)
-        return true;
+        // A full queue is not a reason to report disabled: the spec says to
+        // default to true, and the batch may drain before the record arrives.
+        return self.exporter.enabled(params);
     }
 };
 
@@ -1047,4 +1046,149 @@ test "ScopeFilterProcessor routes each scope to its own exporter" {
     try std.testing.expectEqual(@as(usize, 2), db_recorder.emitted.items.len);
     try std.testing.expectEqualStrings("query executed", db_recorder.emitted.items[0].body.?);
     try std.testing.expectEqualStrings("slow query", db_recorder.emitted.items[1].body.?);
+}
+
+/// An exporter whose enablement the tests can flip, standing in for one with a
+/// real signal such as the `user_events` kernel enablement word.
+const ToggleableExporter = struct {
+    is_enabled: bool = true,
+    reports_enablement: bool = true,
+    seen_severity: ?u8 = null,
+
+    fn asLogRecordExporter(self: *ToggleableExporter) LogRecordExporter {
+        return .{
+            .ptr = self,
+            .vtable = if (self.reports_enablement) &.{
+                .exportLogsFn = exportLogs,
+                .shutdownFn = shutdown,
+                .enabledFn = enabled,
+            } else &.{
+                .exportLogsFn = exportLogs,
+                .shutdownFn = shutdown,
+            },
+        };
+    }
+
+    fn exportLogs(_: *anyopaque, _: []logs.ReadableLogRecord) anyerror!void {}
+
+    fn shutdown(_: *anyopaque) anyerror!void {}
+
+    fn enabled(ctx: *anyopaque, params: EnabledParameters) bool {
+        const self: *ToggleableExporter = @ptrCast(@alignCast(ctx));
+        self.seen_severity = params.severity;
+        return self.is_enabled;
+    }
+};
+
+test "LogRecordExporter.enabled defaults to true without an enabledFn" {
+    var exporter = ToggleableExporter{ .reports_enablement = false, .is_enabled = false };
+    const interface = exporter.asLogRecordExporter();
+
+    // The exporter would answer false, but it does not advertise enablement, so
+    // the interface must assume true rather than silently suppress records.
+    try std.testing.expect(interface.enabled(.{
+        .scope = .{ .name = "test" },
+        .context = context.Context.init(),
+    }));
+}
+
+test "SimpleLogRecordProcessor delegates enabled to its exporter" {
+    const io = std.testing.io;
+
+    var exporter = ToggleableExporter{};
+    var processor = SimpleLogRecordProcessor.init(io, exporter.asLogRecordExporter());
+    const log_processor = processor.asLogRecordProcessor();
+
+    const params = EnabledParameters{
+        .scope = .{ .name = "test" },
+        .severity = 9,
+        .context = context.Context.init(),
+    };
+
+    try std.testing.expect(log_processor.enabled(params));
+    try std.testing.expectEqual(@as(?u8, 9), exporter.seen_severity);
+
+    exporter.is_enabled = false;
+    try std.testing.expect(!log_processor.enabled(params));
+}
+
+test "BatchingLogRecordProcessor delegates enabled to its exporter" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var exporter = ToggleableExporter{};
+    const processor = try BatchingLogRecordProcessor.init(
+        allocator,
+        io,
+        exporter.asLogRecordExporter(),
+        .{},
+    );
+    defer processor.deinit();
+    const log_processor = processor.asLogRecordProcessor();
+
+    const params = EnabledParameters{
+        .scope = .{ .name = "test" },
+        .severity = 9,
+        .context = context.Context.init(),
+    };
+
+    try std.testing.expect(log_processor.enabled(params));
+
+    exporter.is_enabled = false;
+    try std.testing.expect(!log_processor.enabled(params));
+
+    // Shutting down still overrides an enabled exporter.
+    exporter.is_enabled = true;
+    try log_processor.shutdown();
+    try std.testing.expect(!log_processor.enabled(params));
+}
+
+test "ScopeFilterProcessor composes with exporter enablement" {
+    const io = std.testing.io;
+
+    var exporter = ToggleableExporter{};
+    var simple = SimpleLogRecordProcessor.init(io, exporter.asLogRecordExporter());
+    var filter = ScopeFilterProcessor.init(
+        simple.asLogRecordProcessor(),
+        .{ .names = &.{"checkout"} },
+    );
+    const processor = filter.asLogRecordProcessor();
+
+    const checkout = EnabledParameters{
+        .scope = .{ .name = "checkout" },
+        .severity = 9,
+        .context = context.Context.init(),
+    };
+    const db = EnabledParameters{
+        .scope = .{ .name = "db" },
+        .severity = 9,
+        .context = context.Context.init(),
+    };
+
+    try std.testing.expect(processor.enabled(checkout));
+    try std.testing.expect(!processor.enabled(db));
+
+    // A matching scope whose exporter has no listener is still disabled.
+    exporter.is_enabled = false;
+    try std.testing.expect(!processor.enabled(checkout));
+}
+
+test "Logger.enabled reflects exporter enablement" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var exporter = ToggleableExporter{};
+    var processor = SimpleLogRecordProcessor.init(io, exporter.asLogRecordExporter());
+
+    var provider = try logs.LoggerProvider.init(allocator, io, null);
+    defer provider.deinit();
+    try provider.addLogRecordProcessor(processor.asLogRecordProcessor());
+
+    const logger = try provider.getLogger(.{ .name = "checkout" });
+
+    const ctx = context.Context.init();
+    try std.testing.expect(logger.enabled(.{ .severity = 9, .context = ctx }));
+
+    exporter.is_enabled = false;
+    try std.testing.expect(!logger.enabled(.{ .severity = 9, .context = ctx }));
 }

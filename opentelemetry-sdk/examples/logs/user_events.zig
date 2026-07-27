@@ -50,8 +50,9 @@ pub fn main(init: std.process.Init) !void {
     const logger = try provider.getLogger(.{ .name = "example.user_events", .version = "1.0.0" });
 
     // Emitting is nearly free while nobody is collecting, so this check is only
-    // needed to avoid building expensive attribute values.
-    const info_enabled = user_events_exporter.isEnabled(9);
+    // needed to avoid building expensive attribute values. It reads the kernel's
+    // enablement word through the API rather than the exporter type.
+    const info_enabled = logger.enabled(.{ .severity = 9, .context = sdk.api.context.Context.init() });
     std.debug.print("\nA listener has enabled the INFO tracepoint: {}\n", .{info_enabled});
     if (!info_enabled) {
         std.debug.print(
